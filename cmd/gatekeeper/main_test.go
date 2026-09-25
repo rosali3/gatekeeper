@@ -10,8 +10,14 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/goleak"
+
 	"gatekeeper/internal/config"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -29,6 +35,13 @@ func testConfig(upstreamURL string) *config.Config {
 				Balancer: config.BalancerRoundRobin,
 				Targets:  []config.Target{{URL: upstreamURL, Weight: 1}},
 				Timeout:  config.Duration(5 * time.Second),
+				HealthCheck: config.HealthCheckConfig{
+					Path:               "/",
+					Interval:           config.Duration(time.Hour),
+					Timeout:            config.Duration(time.Second),
+					HealthyThreshold:   1,
+					UnhealthyThreshold: 1,
+				},
 			},
 		},
 		Routes: []config.RouteConfig{

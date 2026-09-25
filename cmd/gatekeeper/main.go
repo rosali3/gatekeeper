@@ -69,7 +69,7 @@ func serve(ln net.Listener, cfg *config.Config, log *slog.Logger) error {
 // requests up to shutdownTimeout. Taking ln (rather than binding inside)
 // lets tests use an ephemeral port and know its address up front.
 func run(ctx context.Context, ln net.Listener, cfg *config.Config, log *slog.Logger) error {
-	snap, err := gateway.Build(cfg, log)
+	snap, err := gateway.Build(ctx, cfg, log)
 	if err != nil {
 		return err
 	}

@@ -7,7 +7,7 @@ admin:
   token_env: ADMIN_TOKEN
 upstreams:
   floorplan:
-    balancer: round_robin # weighted_round_robin/least_conn land with health checks in a later stage
+    balancer: least_conn
     targets:
       - { url: http://localhost:9001, weight: 1 }
       - { url: http://localhost:9002, weight: 1 }

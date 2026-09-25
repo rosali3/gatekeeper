@@ -15,6 +15,7 @@ import (
 
 	"gatekeeper/internal/balancer"
 	"gatekeeper/internal/config"
+	"gatekeeper/internal/health"
 	"gatekeeper/internal/middleware"
 	"gatekeeper/internal/reqctx"
 	"gatekeeper/internal/router"
@@ -27,10 +28,11 @@ type upstreamContextKey struct{}
 // Upstream is one configured upstream's runtime state: how to pick a
 // target and how long to wait for it.
 type Upstream struct {
-	Name     string
-	Balancer balancer.Balancer
-	Timeout  time.Duration
-	proxy    *httputil.ReverseProxy
+	Name          string
+	Balancer      balancer.Balancer
+	Timeout       time.Duration
+	proxy         *httputil.ReverseProxy
+	healthChecker *health.Checker
 }
 
 // Snapshot is one immutable generation of everything needed to handle a
@@ -43,11 +45,18 @@ type Snapshot struct {
 }
 
 // Build compiles cfg into a Snapshot, including the fully assembled
-// middleware chain. cfg is assumed already validated (config.Validate).
-func Build(cfg *config.Config, log *slog.Logger) (*Snapshot, error) {
+// middleware chain, and starts one health-check goroutine per upstream
+// bound to ctx - canceling ctx (e.g. on shutdown) stops them.
+// cfg is assumed already validated (config.Validate).
+func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot, error) {
 	transport := newTransport()
 
-	upstreams := make(map[string]*Upstream, len(cfg.Upstreams))
+	// Pass 1: build every balancer before starting anything. If any
+	// upstream is misconfigured, Build returns without ever having
+	// started a health-check goroutine - otherwise a failure partway
+	// through map iteration could leak the checkers already started for
+	// upstreams processed before it.
+	balancers := make(map[string]balancer.Balancer, len(cfg.Upstreams))
 	var errs []error
 	for name, upCfg := range cfg.Upstreams {
 		specs := make([]balancer.TargetSpec, len(upCfg.Targets))
@@ -59,12 +68,31 @@ func Build(cfg *config.Config, log *slog.Logger) (*Snapshot, error) {
 			errs = append(errs, fmt.Errorf("upstream %q: %w", name, err))
 			continue
 		}
-		up := &Upstream{Name: name, Balancer: bal, Timeout: upCfg.Timeout.Duration()}
-		up.proxy = newReverseProxy(name, transport, log)
-		upstreams[name] = up
+		balancers[name] = bal
 	}
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
+	}
+
+	// Pass 2: every balancer is valid, so it's now safe to start a
+	// health-check goroutine per upstream.
+	upstreams := make(map[string]*Upstream, len(cfg.Upstreams))
+	for name, upCfg := range cfg.Upstreams {
+		bal := balancers[name]
+
+		healthCfg := health.Config{
+			Path:               upCfg.HealthCheck.Path,
+			Interval:           upCfg.HealthCheck.Interval.Duration(),
+			Timeout:            upCfg.HealthCheck.Timeout.Duration(),
+			HealthyThreshold:   upCfg.HealthCheck.HealthyThreshold,
+			UnhealthyThreshold: upCfg.HealthCheck.UnhealthyThreshold,
+		}
+		checker := health.NewChecker(name, healthCfg, bal.Targets(), log)
+		go checker.Run(ctx)
+
+		up := &Upstream{Name: name, Balancer: bal, Timeout: upCfg.Timeout.Duration(), healthChecker: checker}
+		up.proxy = newReverseProxy(name, transport, log, checker)
+		upstreams[name] = up
 	}
 
 	snap := &Snapshot{
@@ -123,11 +151,13 @@ func routeMatch(snap *Snapshot) middleware.Middleware {
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	up := r.Context().Value(upstreamContextKey{}).(*Upstream)
 
-	target, err := up.Balancer.Pick()
+	target, release, err := up.Balancer.Pick()
 	if err != nil {
 		http.Error(w, "no healthy upstream targets", http.StatusServiceUnavailable)
 		return
 	}
+	defer release()
+
 	if fields := reqctx.AccessFieldsFrom(r.Context()); fields != nil {
 		fields.Target = target.URL.String()
 	}
