@@ -71,7 +71,7 @@ for it.
 
 ## Quickstart
 
-Requires Go 1.23+.
+Requires Go 1.24+.
 
 ```bash
 go build -o bin/gatekeeper ./cmd/gatekeeper

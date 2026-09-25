@@ -73,7 +73,9 @@ func TestLocal_NeverExceedsBurstCapacity(t *testing.T) {
 	clock := newFakeClock(epoch)
 	l := NewLocal(clock, Config{RPS: 1, Burst: 2})
 
-	l.Allow(context.Background(), "k")
+	if _, err := l.Allow(context.Background(), "k"); err != nil {
+		t.Fatalf("Allow: unexpected error: %v", err)
+	}
 	clock.Advance(time.Hour) // plenty of time to refill way past burst
 
 	res, _ := l.Allow(context.Background(), "k")
@@ -106,7 +108,9 @@ func TestLocal_EvictsIdleBuckets(t *testing.T) {
 	l := NewLocal(clock, Config{RPS: 1, Burst: 1})
 	l.idleTTL = time.Minute
 
-	l.Allow(context.Background(), "k")
+	if _, err := l.Allow(context.Background(), "k"); err != nil {
+		t.Fatalf("Allow: unexpected error: %v", err)
+	}
 	sh := l.shardFor("k")
 	sh.mu.Lock()
 	_, exists := sh.buckets["k"]
