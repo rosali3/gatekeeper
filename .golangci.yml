@@ -1,0 +1,13 @@
+run:
+  timeout: 3m
+
+linters:
+  enable:
+    - bodyclose
+    - gocritic
+    - errcheck
+    - staticcheck
+    - unused
+    - gosimple
+    - ineffassign
+    - govet

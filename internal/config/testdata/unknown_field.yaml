@@ -1,0 +1,21 @@
+server:
+  listen: ":8080"
+  read_header_timeout: 5s
+  max_body_bytes: 10MB
+  bogus_field: true
+admin:
+  listen: ":9090"
+  token_env: ADMIN_TOKEN
+upstreams:
+  floorplan:
+    balancer: least_conn
+    targets:
+      - { url: http://floorplan-api-1:8080, weight: 1 }
+    health_check: { path: /healthz, interval: 5s, timeout: 1s, healthy_threshold: 2, unhealthy_threshold: 3 }
+    circuit_breaker: { failure_ratio: 0.5, min_requests: 20, window: 10s, open_timeout: 15s, half_open_max: 3 }
+    timeout: 30s
+    retries: { max: 2, only_idempotent: true, budget_ratio: 0.1 }
+routes:
+  - match: { path_prefix: /api/floorplan/, methods: [GET] }
+    upstream: floorplan
+    auth: none
