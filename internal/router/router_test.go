@@ -6,6 +6,18 @@ import (
 	"gatekeeper/internal/config"
 )
 
+func TestRoutes_SameOrderAsInput(t *testing.T) {
+	table := Build([]config.RouteConfig{
+		{Match: config.MatchConfig{PathPrefix: "/a/"}, Upstream: "a"},
+		{Match: config.MatchConfig{PathPrefix: "/b/"}, Upstream: "b"},
+	})
+
+	routes := table.Routes()
+	if len(routes) != 2 || routes[0].Upstream != "a" || routes[1].Upstream != "b" {
+		t.Fatalf("Routes() = %v, want [a, b] in input order", routes)
+	}
+}
+
 func TestMatch_LongestPrefixWins(t *testing.T) {
 	table := Build([]config.RouteConfig{
 		{Match: config.MatchConfig{PathPrefix: "/api/"}, Upstream: "generic"},

@@ -37,6 +37,11 @@ and is meant to be explainable, not just "it works."
 - CORS for explicitly allow-listed origins.
 - Structured JSON access logs (`log/slog`) with route/upstream/target/
   status/latency/request_id.
+- Rate limiting per route, by IP or API key: a local sharded/janitored
+  token bucket, or a Redis-backed one (atomic Lua script) shared across
+  multiple gateway instances. `429` responses carry `RateLimit-Limit/
+  Remaining/Reset` and `Retry-After`; a Redis outage fails open or closed
+  per `rate_limit.fail_open`.
 
 ## Architecture
 
@@ -47,7 +52,7 @@ flowchart LR
 
     subgraph chain["Middleware chain (internal/middleware)"]
         direction TB
-        recover[Recover] --> reqid[RequestID] --> alog[AccessLog] --> cors[CORS] --> bodylimit[BodyLimit] --> match[Route match]
+        recover[Recover] --> reqid[RequestID] --> alog[AccessLog] --> cors[CORS] --> bodylimit[BodyLimit] --> match[Route match] --> ratelimit[RateLimit]
     end
 
     chain --> proxy["Proxy handler\n(internal/gateway)"]
@@ -128,38 +133,48 @@ recover → request-id → access-log → CORS → body-limit → route-match �
   reject bad requests before spending effort on routing or auth.
 - **route-match** has to happen before auth/rate-limit/circuit-breaker
   because those are configured per-route.
-- **auth → rate-limit → circuit-breaker → proxy** (bracketed above) is the
-  order specified by the project's spec; auth/rate-limit/circuit-breaker
-  aren't implemented yet, so today route-match hands off straight to the
-  proxy handler.
+- **rate-limit** now runs right after route-match (auth and circuit-breaker
+  slots, bracketed above, aren't implemented yet).
 
 ## Testing
 
 ```bash
-go test ./...              # unit + integration tests (httptest-backed)
-go test -race ./...        # race detector (needs a C toolchain / cgo)
+go test ./...                          # unit + httptest-backed integration tests
+go test -race ./...                    # race detector (needs a C toolchain / cgo)
+go test -tags=integration -race ./...  # + Redis-backed tests (needs Redis, see below)
 go vet ./...
 golangci-lint run ./...
 ```
 
+Tests tagged `integration` (the Redis rate limiter) need a real Redis -
+the Lua script is the whole point, so it's not mocked:
+
+```bash
+docker run -d -p 6379:6379 redis:7-alpine
+make test-integration
+```
+
 Goroutine-leak checks (`go.uber.org/goleak`) run in every package that
-starts background goroutines (health checkers), via `TestMain`.
+starts background goroutines (health checkers, the local rate limiter's
+janitor), via `TestMain`.
 
 Current coverage:
 
 | Package | Coverage |
 |---|---|
 | `internal/balancer` | 100% |
-| `internal/gateway` | 100% |
+| `internal/gateway` | ~96% |
 | `internal/logger` | 100% |
 | `internal/reqctx` | 100% |
 | `internal/router` | 100% |
 | `internal/middleware` | 98.5% |
+| `internal/ratelimit` | 94.5% (unit only; +Redis path under `-tags=integration`) |
 | `internal/health` | 94.7% |
-| `internal/config` | 92.4% |
+| `internal/config` | ~92% |
 
 CI (`.github/workflows/ci.yml`) runs `go vet`, `go test -race` with
-coverage, and `golangci-lint` on every push.
+coverage, the Redis integration tests (a `redis:7-alpine` service
+container), and `golangci-lint` on every push.
 
 ## Roadmap
 
@@ -169,7 +184,7 @@ commit(s) before moving on.
 - [x] Config loading/validation, structured logging, test upstream
 - [x] Router, `ReverseProxy`, headers, timeouts, graceful shutdown
 - [x] Balancers (round robin, weighted round robin, least conn) + active/passive health checks
-- [ ] Rate limiting: local token bucket, then Redis-backed distributed limiting
+- [x] Rate limiting: local token bucket, then Redis-backed distributed limiting
 - [ ] Auth: API key (constant-time compare), JWT/JWKS
 - [ ] Circuit breaker + retries with a budget
 - [ ] Hot reload (SIGHUP/fsnotify, atomic config swap) + admin API

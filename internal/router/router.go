@@ -33,6 +33,12 @@ type Table struct {
 	routes []*Route
 }
 
+// Routes returns the compiled routes in the same order as the
+// []config.RouteConfig passed to Build, so callers that need to associate
+// per-route runtime state (e.g. a rate limiter) with a *Route can zip the
+// two slices together by index.
+func (t *Table) Routes() []*Route { return t.routes }
+
 // Build compiles routes from config in the order given. config.Validate is
 // assumed to have already checked upstream references and enum values.
 func Build(routes []config.RouteConfig) *Table {

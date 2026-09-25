@@ -20,8 +20,9 @@ routes:
     strip_prefix: /api/floorplan
     upstream: floorplan
     auth: jwt
-    rate_limit: { key: api_key, rps: 5, burst: 10, backend: redis }
+    rate_limit: { key: api_key, rps: 5, burst: 10, backend: redis, fail_open: false }
 auth:
   api_keys_file: ./keys.yaml
   jwt: { jwks_url: "http://localhost:8000/.well-known/jwks.json", issuer: gatekeeper-demo, audience: gatekeeper, cache_ttl: 10m }
 cors: { allowed_origins: ["http://localhost:3000"] }
+redis: { addr: "localhost:6379" }

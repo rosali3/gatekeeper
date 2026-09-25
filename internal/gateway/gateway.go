@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
+
 	"gatekeeper/internal/balancer"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/health"
@@ -50,6 +52,14 @@ type Snapshot struct {
 // cfg is assumed already validated (config.Validate).
 func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot, error) {
 	transport := newTransport()
+
+	// Pass 0: validate every route's rate_limit config before anything
+	// else starts a goroutine (health checkers below, rate-limit janitors
+	// later) - otherwise a bad route discovered late could leak whatever
+	// was already started for routes/upstreams processed before it.
+	if err := validateRateLimitRoutes(cfg.Routes); err != nil {
+		return nil, err
+	}
 
 	// Pass 1: build every balancer before starting anything. If any
 	// upstream is misconfigured, Build returns without ever having
@@ -95,10 +105,29 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot
 		upstreams[name] = up
 	}
 
+	routerTable := router.Build(cfg.Routes)
 	snap := &Snapshot{
-		Router:    router.Build(cfg.Routes),
+		Router:    routerTable,
 		Upstreams: upstreams,
 	}
+
+	// The redis client is only actually created if some route's rate_limit
+	// uses backend: redis (config.Validate already guarantees cfg.Redis.Addr
+	// is set in that case). It's shared across every redis-backed route's
+	// limiter - go-redis clients pool their own connections and are safe
+	// for concurrent use.
+	var redisClient goredis.UniversalClient
+	getRedisClient := func() goredis.UniversalClient {
+		if redisClient == nil {
+			redisClient = goredis.NewClient(&goredis.Options{
+				Addr:     cfg.Redis.Addr,
+				Password: cfg.Redis.Password,
+				DB:       cfg.Redis.DB,
+			})
+		}
+		return redisClient
+	}
+	rateLimiters := buildRateLimiters(ctx, cfg.Routes, routerTable.Routes(), getRedisClient)
 
 	corsOrigins := make(map[string]struct{}, len(cfg.CORS.AllowedOrigins))
 	for _, o := range cfg.CORS.AllowedOrigins {
@@ -113,6 +142,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot
 		middleware.CORS(corsOrigins),
 		middleware.BodyLimit(cfg.Server.MaxBodyBytes.Int64()),
 		routeMatch(snap),
+		rateLimit(rateLimiters),
 	)
 
 	return snap, nil
@@ -141,6 +171,7 @@ func routeMatch(snap *Snapshot) middleware.Middleware {
 
 			r.URL.Path = route.StripPath(r.URL.Path)
 			ctx := context.WithValue(r.Context(), upstreamContextKey{}, up)
+			ctx = context.WithValue(ctx, routeContextKey{}, route)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
