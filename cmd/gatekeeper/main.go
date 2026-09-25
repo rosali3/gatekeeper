@@ -51,13 +51,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	if err := run(ctx, ln, cfg, log); err != nil {
+	if err := serve(ln, cfg, log); err != nil {
 		log.Error("server failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// serve owns the signal-context's lifetime, so its defer runs before main
+// can os.Exit on error.
+func serve(ln net.Listener, cfg *config.Config, log *slog.Logger) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return run(ctx, ln, cfg, log)
 }
 
 // run serves the gateway on ln until ctx is canceled, then drains in-flight

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
@@ -19,6 +20,15 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// run holds the defers (signal-context cancellation, shutdown-context
+// cancellation), so any exit path is a plain return - never log.Fatal/
+// os.Exit while those are pending, or they'd be skipped.
+func run() error {
 	addr := getEnv("ADDR", ":9000")
 	name := getEnv("NAME", "test-upstream")
 	delay := getEnvDuration("DELAY", 0)
@@ -43,14 +53,16 @@ func main() {
 	select {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen: %v", err)
+			return fmt.Errorf("listen: %w", err)
 		}
+		return nil
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("shutdown: %v", err)
+			return fmt.Errorf("shutdown: %w", err)
 		}
+		return nil
 	}
 }
 
