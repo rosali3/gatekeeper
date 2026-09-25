@@ -211,6 +211,23 @@ func TestValidate_ReportsMultipleErrors(t *testing.T) {
 	}
 }
 
+func TestValidate_RedisBackendRouteRequiresRedisAddr(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Routes[0].RateLimit = &RateLimitConfig{
+		Key: RateLimitKeyIP, RPS: 5, Burst: 10, Backend: RateLimitBackendRedis,
+	}
+
+	err := Validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "redis.addr") {
+		t.Fatalf("Validate: expected a redis.addr error, got %v", err)
+	}
+
+	cfg.Redis.Addr = "localhost:6379"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate: unexpected error once redis.addr is set: %v", err)
+	}
+}
+
 // minimalValidConfig returns a config equivalent to testdata/valid.yaml but
 // without the redis rate-limit/JWT wiring, so tests can flip one field at a
 // time.

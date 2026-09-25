@@ -58,15 +58,20 @@ func Validate(cfg *Config) error {
 	}
 	needsAPIKeyAuth := false
 	needsJWTAuth := false
+	needsRedis := false
 	for i, route := range cfg.Routes {
 		field := fmt.Sprintf("routes[%d]", i)
-		needsAPIKey, needsJWT := validateRoute(v, field, route, cfg.Upstreams)
+		needsAPIKey, needsJWT, usesRedis := validateRoute(v, field, route, cfg.Upstreams)
 		needsAPIKeyAuth = needsAPIKeyAuth || needsAPIKey
 		needsJWTAuth = needsJWTAuth || needsJWT
+		needsRedis = needsRedis || usesRedis
 	}
 
 	validateAuth(v, cfg.Auth, needsAPIKeyAuth, needsJWTAuth)
 	validateCORS(v, cfg.CORS)
+	if needsRedis {
+		v.require(cfg.Redis.Addr != "", "redis.addr", "must be set: at least one route uses rate_limit.backend: redis")
+	}
 
 	return v.err()
 }
@@ -142,7 +147,7 @@ func validateUpstream(v *validator, field string, up UpstreamConfig) {
 // validateRoute reports whether the route needs auth.api_keys_file /
 // auth.jwt to be configured, so the caller can cross-check that once all
 // routes have been seen.
-func validateRoute(v *validator, field string, r RouteConfig, upstreams map[string]UpstreamConfig) (needsAPIKey, needsJWT bool) {
+func validateRoute(v *validator, field string, r RouteConfig, upstreams map[string]UpstreamConfig) (needsAPIKey, needsJWT, usesRedis bool) {
 	v.require(strings.HasPrefix(r.Match.PathPrefix, "/"), field+".match.path_prefix", "must start with \"/\", got %q", r.Match.PathPrefix)
 	for i, m := range r.Match.Methods {
 		mu := strings.ToUpper(m)
@@ -181,13 +186,15 @@ func validateRoute(v *validator, field string, r RouteConfig, upstreams map[stri
 		v.require(rl.RPS > 0, rf+".rps", "must be > 0")
 		v.require(rl.Burst > 0, rf+".burst", "must be > 0")
 		switch rl.Backend {
-		case RateLimitBackendLocal, RateLimitBackendRedis:
+		case RateLimitBackendLocal:
+		case RateLimitBackendRedis:
+			usesRedis = true
 		default:
 			v.addf(rf+".backend", "unknown rate limit backend %q (want local|redis)", rl.Backend)
 		}
 	}
 
-	return needsAPIKey, needsJWT
+	return needsAPIKey, needsJWT, usesRedis
 }
 
 func validateAuth(v *validator, a AuthConfig, needsAPIKey, needsJWT bool) {

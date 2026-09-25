@@ -10,6 +10,16 @@ type Config struct {
 	Routes    []RouteConfig             `yaml:"routes"`
 	Auth      AuthConfig                `yaml:"auth"`
 	CORS      CORSConfig                `yaml:"cors"`
+	Redis     RedisConfig               `yaml:"redis"`
+}
+
+// RedisConfig is only required if some route's rate_limit.backend is
+// "redis" - it's not in the TZ's example config snippet since that's a
+// deployment detail, not an algorithm choice.
+type RedisConfig struct {
+	Addr     string `yaml:"addr"`
+	Password string `yaml:"password"`
+	DB       int    `yaml:"db"`
 }
 
 type ServerConfig struct {
@@ -72,6 +82,12 @@ type RateLimitConfig struct {
 	RPS     float64 `yaml:"rps"`
 	Burst   int     `yaml:"burst"`
 	Backend string  `yaml:"backend"`
+	// FailOpen only matters for backend: redis - it decides whether a
+	// request is allowed (fail-open) or rejected (fail-closed, the zero
+	// value/default) when Redis itself is unreachable. The TZ calls this
+	// out as something "задаётся в конфиге" (config-driven), unlike most
+	// of the other unwritten defaults in this project.
+	FailOpen bool `yaml:"fail_open"`
 }
 
 type RouteConfig struct {

@@ -25,3 +25,4 @@ auth:
   api_keys_file: ./keys.yaml
   jwt: { jwks_url: "http://auth:8000/.well-known/jwks.json", issuer: gatekeeper-demo, audience: gatekeeper, cache_ttl: 10m }
 cors: { allowed_origins: ["http://localhost:3000"] }
+redis: { addr: "localhost:6379" }
