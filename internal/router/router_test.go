@@ -18,6 +18,15 @@ func TestRoutes_SameOrderAsInput(t *testing.T) {
 	}
 }
 
+func TestBuild_CompilesAuthMode(t *testing.T) {
+	table := Build([]config.RouteConfig{
+		{Match: config.MatchConfig{PathPrefix: "/a/"}, Upstream: "a", Auth: config.AuthJWT},
+	})
+	if got := table.Routes()[0].Auth; got != config.AuthJWT {
+		t.Errorf("Auth = %q, want %q", got, config.AuthJWT)
+	}
+}
+
 func TestMatch_LongestPrefixWins(t *testing.T) {
 	table := Build([]config.RouteConfig{
 		{Match: config.MatchConfig{PathPrefix: "/api/"}, Upstream: "generic"},

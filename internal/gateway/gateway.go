@@ -15,6 +15,7 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 
+	"gatekeeper/internal/auth"
 	"gatekeeper/internal/balancer"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/health"
@@ -59,6 +60,34 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot
 	// was already started for routes/upstreams processed before it.
 	if err := validateRateLimitRoutes(cfg.Routes); err != nil {
 		return nil, err
+	}
+
+	// Also Pass 0: build the (at most one each) API key store / JWT
+	// verifier this config needs, before anything starts a goroutine.
+	// Neither actually starts a goroutine itself (the JWKS client
+	// refreshes lazily on demand), but loading api_keys_file can fail and
+	// should do so before health checkers start, same reasoning as above.
+	var needsAPIKey, needsJWT bool
+	for _, r := range cfg.Routes {
+		switch r.Auth {
+		case config.AuthAPIKey:
+			needsAPIKey = true
+		case config.AuthJWT:
+			needsJWT = true
+		}
+	}
+	var apiKeyStore *auth.APIKeyStore
+	if needsAPIKey {
+		var err error
+		apiKeyStore, err = auth.LoadAPIKeys(cfg.Auth.APIKeysFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading api keys: %w", err)
+		}
+	}
+	var jwtVerifier *auth.JWTVerifier
+	if needsJWT {
+		jwks := auth.NewJWKSClient(cfg.Auth.JWT.JWKSURL, cfg.Auth.JWT.CacheTTL.Duration())
+		jwtVerifier = auth.NewJWTVerifier(jwks, cfg.Auth.JWT.Issuer, cfg.Auth.JWT.Audience)
 	}
 
 	// Pass 1: build every balancer before starting anything. If any
@@ -142,6 +171,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot
 		middleware.CORS(corsOrigins),
 		middleware.BodyLimit(cfg.Server.MaxBodyBytes.Int64()),
 		routeMatch(snap),
+		authenticate(apiKeyStore, jwtVerifier),
 		rateLimit(rateLimiters),
 	)
 

@@ -18,6 +18,7 @@ type Route struct {
 	Methods     map[string]struct{} // empty/nil means "any method"
 	StripPrefix string
 	Upstream    string
+	Auth        string // "none" | "api_key" | "jwt"
 }
 
 func (r *Route) allowsMethod(method string) bool {
@@ -57,6 +58,7 @@ func Build(routes []config.RouteConfig) *Table {
 			Methods:     methods,
 			StripPrefix: r.StripPrefix,
 			Upstream:    r.Upstream,
+			Auth:        r.Auth,
 		})
 	}
 	return &Table{routes: compiled}

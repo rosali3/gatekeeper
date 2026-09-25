@@ -33,6 +33,7 @@ func backend(t *testing.T, name string) *httptest.Server {
 		w.Header().Set("X-Received-Path", r.URL.Path)
 		w.Header().Set("X-Received-Host", r.Host)
 		w.Header().Set("X-Forwarded-For", r.Header.Get("X-Forwarded-For"))
+		w.Header().Set("X-Received-User-ID", r.Header.Get("X-User-ID"))
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
