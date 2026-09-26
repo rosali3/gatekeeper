@@ -48,6 +48,13 @@ and is meant to be explainable, not just "it works."
   unknown `kid`, fixed asymmetric-algorithm allow-list so `alg: none`/
   algorithm confusion can't get through, iss/aud/exp/nbf checked). A
   valid JWT's `sub` is forwarded upstream as `X-User-ID`.
+- A circuit breaker per upstream (closed → open → half-open) over a
+  bucketed sliding window of failures; open trips return `503` without
+  ever dialing the upstream. Idempotent-method requests (or any method,
+  if `only_idempotent: false`) retry on another target for network
+  errors/502/503/504, capped by both `retries.max` and a retry budget
+  (retries ≤ `budget_ratio` of recent request volume) so a struggling
+  upstream can't be hit with a multiplying retry storm.
 
 ## Architecture
 
@@ -61,7 +68,10 @@ flowchart LR
         recover[Recover] --> reqid[RequestID] --> alog[AccessLog] --> cors[CORS] --> bodylimit[BodyLimit] --> match[Route match] --> authn[Authenticate] --> ratelimit[RateLimit]
     end
 
-    chain --> proxy["Proxy handler\n(internal/gateway)"]
+    chain --> cb{"Breaker.Allow()?\n(internal/breaker)"}
+    cb -->|open: 503| client
+    cb -->|closed/half-open| proxy["Proxy handler\n(internal/gateway)"]
+    proxy -.retry on 502/503/504.-> proxy
     proxy --> bal["Balancer.Pick()\n(internal/balancer)"]
     bal --> t1[(Target 1)]
     bal --> t2[(Target 2)]
@@ -126,7 +136,7 @@ routes:
 ## Middleware order, and why
 
 ```
-recover → request-id → access-log → CORS → body-limit → route-match → auth → rate-limit → [circuit-breaker] → proxy
+recover → request-id → access-log → CORS → body-limit → route-match → auth → rate-limit → circuit-breaker → proxy (+retries)
 ```
 
 - **recover** is outermost so it can catch a panic from every layer below it.
@@ -141,7 +151,10 @@ recover → request-id → access-log → CORS → body-limit → route-match �
   because those are configured per-route.
 - **auth** must reject before **rate-limit** spends a token on a request
   that was going to be denied anyway.
-- **circuit-breaker** (bracketed above) isn't implemented yet.
+- **circuit-breaker** is checked right before proxying - an open breaker
+  must short-circuit before dialing anything, which is also why it's
+  the very last gate rather than sharing route-match's position: it's
+  upstream-scoped state, not route config.
 
 ## Testing
 
@@ -173,7 +186,8 @@ Current coverage:
 | `internal/router` | 100% |
 | `internal/logger` | 100% |
 | `internal/reqctx` | 100% |
-| `internal/gateway` | ~96% |
+| `internal/breaker` | ~96% |
+| `internal/gateway` | ~94% |
 | `internal/middleware` | 98.5% |
 | `internal/health` | 94.7% |
 | `internal/ratelimit` | 94.5% (unit only; +Redis path under `-tags=integration`) |
@@ -194,7 +208,7 @@ commit(s) before moving on.
 - [x] Balancers (round robin, weighted round robin, least conn) + active/passive health checks
 - [x] Rate limiting: local token bucket, then Redis-backed distributed limiting
 - [x] Auth: API key (constant-time compare), JWT/JWKS
-- [ ] Circuit breaker + retries with a budget
+- [x] Circuit breaker + retries with a budget
 - [ ] Hot reload (SIGHUP/fsnotify, atomic config swap) + admin API
 - [ ] Metrics (Prometheus), tracing (OpenTelemetry), Grafana dashboard
 - [ ] Benchmarks, load test, docker-compose demo, ADRs, interview Q&A doc
