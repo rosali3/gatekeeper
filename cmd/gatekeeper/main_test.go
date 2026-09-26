@@ -42,6 +42,13 @@ func testConfig(upstreamURL string) *config.Config {
 					HealthyThreshold:   1,
 					UnhealthyThreshold: 1,
 				},
+				CircuitBreaker: config.CircuitBreakerConfig{
+					FailureRatio: 0.5,
+					MinRequests:  1000,
+					Window:       config.Duration(10 * time.Second),
+					OpenTimeout:  config.Duration(time.Second),
+					HalfOpenMax:  1,
+				},
 			},
 		},
 		Routes: []config.RouteConfig{

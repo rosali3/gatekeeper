@@ -50,6 +50,19 @@ func testHealthCheck() config.HealthCheckConfig {
 	}
 }
 
+// testCircuitBreaker is deliberately hard to trip (a high minRequests)
+// so tests that aren't specifically exercising breaker behavior don't
+// accidentally open it via ordinary traffic.
+func testCircuitBreaker() config.CircuitBreakerConfig {
+	return config.CircuitBreakerConfig{
+		FailureRatio: 0.5,
+		MinRequests:  1000,
+		Window:       config.Duration(10 * time.Second),
+		OpenTimeout:  config.Duration(time.Second),
+		HalfOpenMax:  1,
+	}
+}
+
 func baseConfig(upstreamURL string) *config.Config {
 	return &config.Config{
 		Server: config.ServerConfig{
@@ -59,10 +72,11 @@ func baseConfig(upstreamURL string) *config.Config {
 		},
 		Upstreams: map[string]config.UpstreamConfig{
 			"demo": {
-				Balancer:    config.BalancerRoundRobin,
-				Targets:     []config.Target{{URL: upstreamURL, Weight: 1}},
-				Timeout:     config.Duration(2 * time.Second),
-				HealthCheck: testHealthCheck(),
+				Balancer:       config.BalancerRoundRobin,
+				Targets:        []config.Target{{URL: upstreamURL, Weight: 1}},
+				Timeout:        config.Duration(2 * time.Second),
+				HealthCheck:    testHealthCheck(),
+				CircuitBreaker: testCircuitBreaker(),
 			},
 		},
 		Routes: []config.RouteConfig{
@@ -161,10 +175,11 @@ func TestGateway_UpstreamTimeout(t *testing.T) {
 
 	cfg := baseConfig(slow.URL)
 	cfg.Upstreams["demo"] = config.UpstreamConfig{
-		Balancer:    config.BalancerRoundRobin,
-		Targets:     []config.Target{{URL: slow.URL, Weight: 1}},
-		Timeout:     config.Duration(10 * time.Millisecond),
-		HealthCheck: testHealthCheck(),
+		Balancer:       config.BalancerRoundRobin,
+		Targets:        []config.Target{{URL: slow.URL, Weight: 1}},
+		Timeout:        config.Duration(10 * time.Millisecond),
+		HealthCheck:    testHealthCheck(),
+		CircuitBreaker: testCircuitBreaker(),
 	}
 
 	snap := buildSnapshot(t, cfg)
@@ -194,10 +209,11 @@ func TestGateway_NoSnapshotYet(t *testing.T) {
 func TestBuild_UnknownBalancerFails(t *testing.T) {
 	cfg := baseConfig("http://127.0.0.1:1")
 	cfg.Upstreams["demo"] = config.UpstreamConfig{
-		Balancer:    "bogus",
-		Targets:     []config.Target{{URL: "http://127.0.0.1:1", Weight: 1}},
-		Timeout:     config.Duration(time.Second),
-		HealthCheck: testHealthCheck(),
+		Balancer:       "bogus",
+		Targets:        []config.Target{{URL: "http://127.0.0.1:1", Weight: 1}},
+		Timeout:        config.Duration(time.Second),
+		HealthCheck:    testHealthCheck(),
+		CircuitBreaker: testCircuitBreaker(),
 	}
 
 	// No goroutines are started on this path (Build validates every
@@ -222,6 +238,7 @@ func TestGateway_PassiveFailureMarksTargetUnhealthy(t *testing.T) {
 			Path: "/", Interval: config.Duration(time.Hour), Timeout: config.Duration(100 * time.Millisecond),
 			HealthyThreshold: 1, UnhealthyThreshold: 1,
 		},
+		CircuitBreaker: testCircuitBreaker(),
 	}
 
 	snap := buildSnapshot(t, cfg)

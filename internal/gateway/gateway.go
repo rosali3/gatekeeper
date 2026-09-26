@@ -4,9 +4,11 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -17,6 +19,7 @@ import (
 
 	"gatekeeper/internal/auth"
 	"gatekeeper/internal/balancer"
+	"gatekeeper/internal/breaker"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/health"
 	"gatekeeper/internal/middleware"
@@ -36,6 +39,9 @@ type Upstream struct {
 	Timeout       time.Duration
 	proxy         *httputil.ReverseProxy
 	healthChecker *health.Checker
+	breaker       *breaker.CircuitBreaker
+	retryBudget   *breaker.RetryBudget
+	retries       config.RetriesConfig
 }
 
 // Snapshot is one immutable generation of everything needed to handle a
@@ -129,7 +135,24 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot
 		checker := health.NewChecker(name, healthCfg, bal.Targets(), log)
 		go checker.Run(ctx)
 
-		up := &Upstream{Name: name, Balancer: bal, Timeout: upCfg.Timeout.Duration(), healthChecker: checker}
+		cb := breaker.New(breaker.RealClock{}, breaker.Config{
+			FailureRatio: upCfg.CircuitBreaker.FailureRatio,
+			MinRequests:  upCfg.CircuitBreaker.MinRequests,
+			Window:       upCfg.CircuitBreaker.Window.Duration(),
+			OpenTimeout:  upCfg.CircuitBreaker.OpenTimeout.Duration(),
+			HalfOpenMax:  upCfg.CircuitBreaker.HalfOpenMax,
+		})
+		retryBudget := breaker.NewRetryBudget(breaker.RealClock{}, upCfg.Retries.BudgetRatio)
+
+		up := &Upstream{
+			Name:          name,
+			Balancer:      bal,
+			Timeout:       upCfg.Timeout.Duration(),
+			healthChecker: checker,
+			breaker:       cb,
+			retryBudget:   retryBudget,
+			retries:       upCfg.Retries,
+		}
 		up.proxy = newReverseProxy(name, transport, log, checker)
 		upstreams[name] = up
 	}
@@ -208,9 +231,75 @@ func routeMatch(snap *Snapshot) middleware.Middleware {
 }
 
 // proxyHandler picks a target for the upstream resolved by routeMatch,
-// bounds the request to the upstream's configured timeout, and proxies it.
+// bounds the request to the upstream's configured timeout, and proxies
+// it - retrying on another target if the route's retry policy allows it.
+//
+// Retrying safely requires not having already sent bytes to the real
+// client, so this only buffers a whole attempt's response (via
+// bufferedResponse) when retries are actually possible for this request;
+// otherwise it streams straight through exactly as before, at no extra
+// allocation/latency cost - see retry.go.
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	up := r.Context().Value(upstreamContextKey{}).(*Upstream)
+	up.retryBudget.RecordRequest()
+
+	canRetry := up.retries.Max > 0 && (!up.retries.OnlyIdempotent || isIdempotentMethod(r.Method))
+	if !canRetry {
+		proxyOnce(w, up, r)
+		return
+	}
+
+	var bodyBytes []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+		bodyBytes = b
+	}
+
+	var rec *bufferedResponse
+	for attempt := 0; attempt <= up.retries.Max; attempt++ {
+		if !up.breaker.Allow() {
+			http.Error(w, "circuit breaker open", http.StatusServiceUnavailable)
+			return
+		}
+		target, release, err := up.Balancer.Pick()
+		if err != nil {
+			http.Error(w, "no healthy upstream targets", http.StatusServiceUnavailable)
+			return
+		}
+		if fields := reqctx.AccessFieldsFrom(r.Context()); fields != nil {
+			fields.Target = target.URL.String()
+		}
+		if bodyBytes != nil {
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		rec = newBufferedResponse()
+		ctx, cancel := context.WithTimeout(r.Context(), up.Timeout)
+		ctx = context.WithValue(ctx, targetContextKey{}, target)
+		up.proxy.ServeHTTP(rec, r.WithContext(ctx))
+		cancel()
+		release()
+
+		retryable := isRetryableStatus(rec.status)
+		up.breaker.RecordResult(!retryable)
+		if !retryable || attempt == up.retries.Max || !up.retryBudget.AllowRetry() {
+			break
+		}
+	}
+	rec.copyTo(w)
+}
+
+// proxyOnce is the no-retry fast path: single attempt, no body buffering.
+func proxyOnce(w http.ResponseWriter, up *Upstream, r *http.Request) {
+	if !up.breaker.Allow() {
+		http.Error(w, "circuit breaker open", http.StatusServiceUnavailable)
+		return
+	}
 
 	target, release, err := up.Balancer.Pick()
 	if err != nil {
@@ -226,7 +315,10 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), up.Timeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, targetContextKey{}, target)
-	up.proxy.ServeHTTP(w, r.WithContext(ctx))
+
+	rw := &statusRecordingWriter{ResponseWriter: w}
+	up.proxy.ServeHTTP(rw, r.WithContext(ctx))
+	up.breaker.RecordResult(!isRetryableStatus(rw.status))
 }
 
 // Gateway is the gateway's top-level http.Handler. Its Snapshot can be
