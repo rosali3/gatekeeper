@@ -58,14 +58,17 @@ pause
 step "4. Waiting out the rate limit window before continuing"
 sleep 3
 
-step "5. upstream-3 is deliberately flaky (ERROR_RATE=0.3, DELAY=100ms) - watch it get evicted"
+step "5. upstream-3 is deliberately flaky (ERROR_RATE=0.75, DELAY=100ms) - watch it get evicted"
 echo "Current target health per gatekeeper-1:"
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "$ADMIN1/admin/upstreams" | (command -v jq >/dev/null && jq . || cat)
 echo
-echo "Sending traffic for a while so active/passive checks have a chance to catch it..."
-for i in $(seq 1 20); do
+echo "Waiting for active health checks (interval=3s, unhealthy_threshold=2) to catch it."
+echo "This is probabilistic (75% failure rate on /healthz) - usually flips within ~20s."
+echo "(Spacing these out at well under the rps=2 limit so it doesn't drain the bucket"
+echo "step 7 needs below - the active health checker runs on its own timer regardless.)"
+for i in $(seq 1 10); do
   curl -s -o /dev/null "$GW1/api/demo/rooms" || true
-  sleep 0.3
+  sleep 2
 done
 echo
 echo "Target health now:"
@@ -80,15 +83,20 @@ step "7. Hot reload: bumping the rate limit burst in the mounted config file"
 CONFIG="$ROOT/docker/gatekeeper.yaml"
 cp "$CONFIG" "$CONFIG.bak"
 sed -i 's/burst: 5/burst: 50/' "$CONFIG"
-echo "Edited $CONFIG (burst: 5 -> 50). Waiting for fsnotify + debounce to pick it up..."
-sleep 2
+echo "Edited $CONFIG (burst: 5 -> 50)."
+echo "Note: fsnotify on this file is proven directly by TestRun_ReloadViaFileChange"
+echo "(cmd/gatekeeper/main_test.go) running the binary on the host. Docker Desktop's"
+echo "bind-mount layer doesn't reliably forward inotify events for host-side edits,"
+echo "so this demo triggers the same reload path explicitly via the admin API instead:"
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "$ADMIN1/admin/reload"
+echo
 echo "Bursting again - should no longer 429 as quickly:"
 for i in $(seq 1 8); do
   code=$(curl -s -o /dev/null -w "%{http_code}" "$GW1/api/demo/rooms")
   echo "  request $i -> $code"
 done
 echo
-echo "Restoring the original config and triggering a reload via the admin API..."
+echo "Restoring the original config and reloading once more..."
 mv "$CONFIG.bak" "$CONFIG"
 curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "$ADMIN1/admin/reload"
 echo

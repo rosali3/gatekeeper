@@ -72,7 +72,7 @@ func run() error {
 func newMux(name string, delay time.Duration, errorRate float64, healthy bool) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if !healthy {
+		if !healthy || (errorRate > 0 && rand.Float64() < errorRate) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
