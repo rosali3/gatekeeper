@@ -157,7 +157,7 @@ func TestBuild_RateLimitJWTSubNotImplemented(t *testing.T) {
 		Key: config.RateLimitKeyJWTSub, RPS: 1, Burst: 1, Backend: config.RateLimitBackendLocal,
 	})
 
-	if _, err := Build(context.Background(), cfg, testLogger()); err == nil {
+	if _, err := Build(context.Background(), cfg, testLogger(), nil); err == nil {
 		t.Fatal("Build: expected an error for rate_limit.key: jwt_sub, got nil")
 	}
 }
@@ -177,7 +177,7 @@ func TestBuild_RateLimitJWTSubFailsBeforeStartingGoroutines(t *testing.T) {
 		HealthCheck: testHealthCheck(),
 	}
 
-	if _, err := Build(context.Background(), cfg, testLogger()); err == nil {
+	if _, err := Build(context.Background(), cfg, testLogger(), nil); err == nil {
 		t.Fatal("Build: expected an error, got nil")
 	}
 }

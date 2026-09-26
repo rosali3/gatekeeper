@@ -98,7 +98,7 @@ func buildSnapshot(t *testing.T, cfg *config.Config) *Snapshot {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	snap, err := Build(ctx, cfg, testLogger())
+	snap, err := Build(ctx, cfg, testLogger(), nil)
 	if err != nil {
 		t.Fatalf("Build: unexpected error: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestBuild_UnknownBalancerFails(t *testing.T) {
 	// No goroutines are started on this path (Build validates every
 	// balancer before starting any health checker), so no context/cleanup
 	// dance is needed here.
-	if _, err := Build(context.Background(), cfg, testLogger()); err == nil {
+	if _, err := Build(context.Background(), cfg, testLogger(), nil); err == nil {
 		t.Fatal("Build: expected error for an unknown balancer, got nil")
 	}
 }

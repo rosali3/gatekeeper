@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"reflect"
 	"sync/atomic"
 	"time"
 
@@ -42,22 +43,44 @@ type Upstream struct {
 	breaker       *breaker.CircuitBreaker
 	retryBudget   *breaker.RetryBudget
 	retries       config.RetriesConfig
+
+	// stopHealthChecker cancels this upstream's health-check goroutine.
+	// Reload calls it for any upstream not carried over into the new
+	// Snapshot (removed, or config changed), so a goroutine is never
+	// left running for a generation nothing references anymore.
+	stopHealthChecker context.CancelFunc
 }
 
 // Snapshot is one immutable generation of everything needed to handle a
-// request. A config reload (stage 7) builds a new Snapshot and swaps it in
-// atomically via Gateway.Swap, so in-flight requests keep using the old one.
+// request. A config reload builds a new Snapshot and swaps it in
+// atomically via Gateway.Swap, so in-flight requests keep using the old
+// one. upstreamConfigs/routeConfigs/routeLimiters exist purely so the
+// *next* reload can tell what changed - see Build's reuse logic.
 type Snapshot struct {
-	Router    *router.Table
-	Upstreams map[string]*Upstream
-	Handler   http.Handler
+	Router          *router.Table
+	Upstreams       map[string]*Upstream
+	Handler         http.Handler
+	upstreamConfigs map[string]config.UpstreamConfig
+	routeConfigs    []config.RouteConfig
+	routeLimiters   []*routeRateLimit
 }
 
 // Build compiles cfg into a Snapshot, including the fully assembled
 // middleware chain, and starts one health-check goroutine per upstream
 // bound to ctx - canceling ctx (e.g. on shutdown) stops them.
+//
+// prev is the currently-running Snapshot being reloaded, or nil for the
+// first load. For any upstream/route whose relevant config is byte-for-
+// byte identical to prev's, Build reuses its existing balancer (with
+// whatever target health/active-conn state it has), circuit breaker,
+// retry budget and rate limiter instead of building fresh ones - so a
+// reload doesn't reset in-flight breaker/limiter state for parts of the
+// config that didn't change. Anything not reused from prev has its
+// health-checker/janitor goroutine stopped once the new Snapshot is
+// built, so reloading repeatedly can't accumulate goroutines.
+//
 // cfg is assumed already validated (config.Validate).
-func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot, error) {
+func Build(ctx context.Context, cfg *config.Config, log *slog.Logger, prev *Snapshot) (*Snapshot, error) {
 	transport := newTransport()
 
 	// Pass 0: validate every route's rate_limit config before anything
@@ -120,9 +143,20 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot
 	}
 
 	// Pass 2: every balancer is valid, so it's now safe to start a
-	// health-check goroutine per upstream.
+	// health-check goroutine per upstream (unless we're reusing prev's).
 	upstreams := make(map[string]*Upstream, len(cfg.Upstreams))
+	reusedFromPrev := make(map[string]bool, len(cfg.Upstreams))
 	for name, upCfg := range cfg.Upstreams {
+		if prev != nil {
+			if oldUp, ok := prev.Upstreams[name]; ok {
+				if oldCfg, ok2 := prev.upstreamConfigs[name]; ok2 && reflect.DeepEqual(oldCfg, upCfg) {
+					upstreams[name] = oldUp
+					reusedFromPrev[name] = true
+					continue
+				}
+			}
+		}
+
 		bal := balancers[name]
 
 		healthCfg := health.Config{
@@ -132,8 +166,9 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot
 			HealthyThreshold:   upCfg.HealthCheck.HealthyThreshold,
 			UnhealthyThreshold: upCfg.HealthCheck.UnhealthyThreshold,
 		}
+		checkerCtx, stopChecker := context.WithCancel(ctx)
 		checker := health.NewChecker(name, healthCfg, bal.Targets(), log)
-		go checker.Run(ctx)
+		go checker.Run(checkerCtx)
 
 		cb := breaker.New(breaker.RealClock{}, breaker.Config{
 			FailureRatio: upCfg.CircuitBreaker.FailureRatio,
@@ -145,22 +180,37 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot
 		retryBudget := breaker.NewRetryBudget(breaker.RealClock{}, upCfg.Retries.BudgetRatio)
 
 		up := &Upstream{
-			Name:          name,
-			Balancer:      bal,
-			Timeout:       upCfg.Timeout.Duration(),
-			healthChecker: checker,
-			breaker:       cb,
-			retryBudget:   retryBudget,
-			retries:       upCfg.Retries,
+			Name:              name,
+			Balancer:          bal,
+			Timeout:           upCfg.Timeout.Duration(),
+			healthChecker:     checker,
+			breaker:           cb,
+			retryBudget:       retryBudget,
+			retries:           upCfg.Retries,
+			stopHealthChecker: stopChecker,
 		}
 		up.proxy = newReverseProxy(name, transport, log, checker)
 		upstreams[name] = up
 	}
+	if prev != nil {
+		for name, oldUp := range prev.Upstreams {
+			if !reusedFromPrev[name] {
+				oldUp.stopHealthChecker()
+			}
+		}
+	}
+
+	upstreamConfigs := make(map[string]config.UpstreamConfig, len(cfg.Upstreams))
+	for name, upCfg := range cfg.Upstreams {
+		upstreamConfigs[name] = upCfg
+	}
 
 	routerTable := router.Build(cfg.Routes)
 	snap := &Snapshot{
-		Router:    routerTable,
-		Upstreams: upstreams,
+		Router:          routerTable,
+		Upstreams:       upstreams,
+		upstreamConfigs: upstreamConfigs,
+		routeConfigs:    cfg.Routes,
 	}
 
 	// The redis client is only actually created if some route's rate_limit
@@ -179,7 +229,14 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Snapshot
 		}
 		return redisClient
 	}
-	rateLimiters := buildRateLimiters(ctx, cfg.Routes, routerTable.Routes(), getRedisClient)
+	var prevRouteConfigs []config.RouteConfig
+	var prevRouteLimiters []*routeRateLimit
+	if prev != nil {
+		prevRouteConfigs = prev.routeConfigs
+		prevRouteLimiters = prev.routeLimiters
+	}
+	rateLimiters, routeLimiters := buildRateLimiters(ctx, cfg.Routes, routerTable.Routes(), getRedisClient, prevRouteConfigs, prevRouteLimiters)
+	snap.routeLimiters = routeLimiters
 
 	corsOrigins := make(map[string]struct{}, len(cfg.CORS.AllowedOrigins))
 	for _, o := range cfg.CORS.AllowedOrigins {
