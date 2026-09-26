@@ -394,6 +394,25 @@ func (g *Gateway) Swap(s *Snapshot) {
 	g.snap.Store(s)
 }
 
+// Current returns the snapshot in effect right now, or nil before the
+// first Swap - e.g. for the admin API to introspect, or for Build's prev
+// parameter on the next reload.
+func (g *Gateway) Current() *Snapshot {
+	return g.snap.Load()
+}
+
+// RouteConfigs returns the config each route was compiled from, for the
+// admin API's GET /admin/routes.
+func (s *Snapshot) RouteConfigs() []config.RouteConfig {
+	return s.routeConfigs
+}
+
+// BreakerState reports this upstream's circuit breaker state (closed/
+// open/half_open), for the admin API's GET /admin/upstreams.
+func (u *Upstream) BreakerState() string {
+	return u.breaker.State().String()
+}
+
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	snap := g.snap.Load()
 	if snap == nil {

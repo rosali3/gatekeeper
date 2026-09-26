@@ -71,31 +71,35 @@ type UpstreamConfig struct {
 
 // MatchConfig selects requests for a route. Host is optional (empty matches
 // any host); PathPrefix is required.
+//
+// json tags exist alongside yaml ones because the admin API's
+// GET /admin/routes serializes RouteConfig (and its nested types)
+// directly as JSON.
 type MatchConfig struct {
-	Host       string   `yaml:"host"`
-	PathPrefix string   `yaml:"path_prefix"`
-	Methods    []string `yaml:"methods"`
+	Host       string   `yaml:"host" json:"host"`
+	PathPrefix string   `yaml:"path_prefix" json:"path_prefix"`
+	Methods    []string `yaml:"methods" json:"methods"`
 }
 
 type RateLimitConfig struct {
-	Key     string  `yaml:"key"`
-	RPS     float64 `yaml:"rps"`
-	Burst   int     `yaml:"burst"`
-	Backend string  `yaml:"backend"`
+	Key     string  `yaml:"key" json:"key"`
+	RPS     float64 `yaml:"rps" json:"rps"`
+	Burst   int     `yaml:"burst" json:"burst"`
+	Backend string  `yaml:"backend" json:"backend"`
 	// FailOpen only matters for backend: redis - it decides whether a
 	// request is allowed (fail-open) or rejected (fail-closed, the zero
 	// value/default) when Redis itself is unreachable. The TZ calls this
 	// out as something "задаётся в конфиге" (config-driven), unlike most
 	// of the other unwritten defaults in this project.
-	FailOpen bool `yaml:"fail_open"`
+	FailOpen bool `yaml:"fail_open" json:"fail_open"`
 }
 
 type RouteConfig struct {
-	Match       MatchConfig      `yaml:"match"`
-	StripPrefix string           `yaml:"strip_prefix"`
-	Upstream    string           `yaml:"upstream"`
-	Auth        string           `yaml:"auth"`
-	RateLimit   *RateLimitConfig `yaml:"rate_limit"`
+	Match       MatchConfig      `yaml:"match" json:"match"`
+	StripPrefix string           `yaml:"strip_prefix" json:"strip_prefix"`
+	Upstream    string           `yaml:"upstream" json:"upstream"`
+	Auth        string           `yaml:"auth" json:"auth"`
+	RateLimit   *RateLimitConfig `yaml:"rate_limit" json:"rate_limit,omitempty"`
 }
 
 type JWTConfig struct {
