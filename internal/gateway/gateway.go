@@ -23,6 +23,7 @@ import (
 	"gatekeeper/internal/breaker"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/health"
+	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/middleware"
 	"gatekeeper/internal/reqctx"
 	"gatekeeper/internal/router"
@@ -248,6 +249,8 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger, prev *Snap
 		middleware.Recover(log),
 		middleware.RequestID(),
 		middleware.AccessLog(log),
+		middleware.Metrics(),
+		middleware.Tracing("gatekeeper"),
 		middleware.CORS(corsOrigins),
 		middleware.BodyLimit(cfg.Server.MaxBodyBytes.Int64()),
 		routeMatch(snap),
@@ -335,15 +338,25 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 
+		if attempt > 0 {
+			metrics.RetriesTotal.WithLabelValues(up.Name).Inc()
+		}
+
 		rec = newBufferedResponse()
 		ctx, cancel := context.WithTimeout(r.Context(), up.Timeout)
 		ctx = context.WithValue(ctx, targetContextKey{}, target)
+
+		start := time.Now()
+		metrics.ActiveConnections.WithLabelValues(up.Name).Inc()
 		up.proxy.ServeHTTP(rec, r.WithContext(ctx))
+		metrics.ActiveConnections.WithLabelValues(up.Name).Dec()
+		metrics.UpstreamDuration.WithLabelValues(up.Name, target.URL.String()).Observe(time.Since(start).Seconds())
 		cancel()
 		release()
 
 		retryable := isRetryableStatus(rec.status)
 		up.breaker.RecordResult(!retryable)
+		metrics.CircuitState.WithLabelValues(up.Name).Set(float64(up.breaker.State()))
 		if !retryable || attempt == up.retries.Max || !up.retryBudget.AllowRetry() {
 			break
 		}
@@ -374,8 +387,14 @@ func proxyOnce(w http.ResponseWriter, up *Upstream, r *http.Request) {
 	ctx = context.WithValue(ctx, targetContextKey{}, target)
 
 	rw := &statusRecordingWriter{ResponseWriter: w}
+	start := time.Now()
+	metrics.ActiveConnections.WithLabelValues(up.Name).Inc()
 	up.proxy.ServeHTTP(rw, r.WithContext(ctx))
+	metrics.ActiveConnections.WithLabelValues(up.Name).Dec()
+	metrics.UpstreamDuration.WithLabelValues(up.Name, target.URL.String()).Observe(time.Since(start).Seconds())
+
 	up.breaker.RecordResult(!isRetryableStatus(rw.status))
+	metrics.CircuitState.WithLabelValues(up.Name).Set(float64(up.breaker.State()))
 }
 
 // Gateway is the gateway's top-level http.Handler. Its Snapshot can be
@@ -411,6 +430,29 @@ func (s *Snapshot) RouteConfigs() []config.RouteConfig {
 // open/half_open), for the admin API's GET /admin/upstreams.
 func (u *Upstream) BreakerState() string {
 	return u.breaker.State().String()
+}
+
+// RefreshMetrics sets gateway_upstream_healthy and gateway_circuit_state
+// for every upstream/target in the current snapshot. Unlike the other
+// metrics (recorded exactly when the event happens - a request, a
+// retry), health and breaker state are ongoing conditions with no single
+// triggering event of their own, so the caller polls this on a timer
+// instead. A no-op before the first Swap.
+func (g *Gateway) RefreshMetrics() {
+	snap := g.Current()
+	if snap == nil {
+		return
+	}
+	for name, up := range snap.Upstreams {
+		metrics.CircuitState.WithLabelValues(name).Set(float64(up.breaker.State()))
+		for _, t := range up.Balancer.Targets() {
+			healthy := 0.0
+			if t.Healthy() {
+				healthy = 1
+			}
+			metrics.UpstreamHealthy.WithLabelValues(name, t.URL.String()).Set(healthy)
+		}
+	}
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {

@@ -13,6 +13,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	"gatekeeper/internal/config"
+	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/middleware"
 	"gatekeeper/internal/ratelimit"
 	"gatekeeper/internal/router"
@@ -149,6 +150,7 @@ func rateLimit(limiters map[*router.Route]*routeRateLimit) middleware.Middleware
 			w.Header().Set("RateLimit-Reset", strconv.Itoa(int(math.Ceil(result.ResetIn.Seconds()))))
 			if !result.Allowed {
 				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(result.RetryAfter.Seconds()))))
+				metrics.RateLimitRejected.WithLabelValues(route.PathPrefix).Inc()
 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}
