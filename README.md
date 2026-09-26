@@ -9,9 +9,9 @@ and is meant to be explainable, not just "it works."
 
 [![CI](https://github.com/rosali3/gatekeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/rosali3/gatekeeper/actions/workflows/ci.yml)
 
-> **Status: work in progress**, built stage by stage. This README reflects
-> what's actually implemented today, not the final target — see
-> [Roadmap](#roadmap) for what's still missing.
+> Built stage by stage, per the spec's own "Порядок работы" - each
+> stage landed with green tests and its own commit(s) before moving on.
+> See [Roadmap](#roadmap) for the stage list.
 
 ## What it does today
 
@@ -74,9 +74,23 @@ and is meant to be explainable, not just "it works."
   health/breaker state, which get polled every 5s since they're ongoing
   conditions rather than one-off events. OpenTelemetry tracing:
   incoming `traceparent` is extracted, a span started, and an updated
-  `traceparent` injected into the outbound upstream request - no
-  exporter wired yet (that's the docker-compose/Jaeger stage), so spans
-  propagate correctly today but aren't shipped anywhere yet.
+  `traceparent` injected into the outbound upstream request. An OTLP/
+  gRPC exporter (e.g. to Jaeger) activates when `OTEL_EXPORTER_OTLP_
+  ENDPOINT` is set - unset (local dev/tests), spans still propagate but
+  aren't shipped anywhere, which is all that needs.
+- A `docker-compose.yml` demo: two gatekeeper instances sharing one
+  Redis-backed rate limit, three test upstreams (one deliberately
+  flaky), Prometheus + a provisioned Grafana dashboard, Jaeger, and a
+  minimal JWKS mock identity provider. `scripts/demo.sh` walks through
+  JWT auth, `429`s, an upstream going unhealthy, the circuit breaker
+  opening, and a hot reload triggered via the admin API.
+- Benchmarks (`go test -bench=. -benchmem`) for the hot path (route
+  match, rate limiter, each balancer) and the full gateway request
+  path; a `vegeta`-based load test comparing direct-to-upstream vs
+  through-gatekeeper latency/throughput. Numbers in
+  [Benchmarks & load test](#benchmarks--load-test) below.
+- Six ADRs (`docs/adr/`) and 25 code-referencing interview questions
+  (`docs/INTERVIEW.md`).
 
 ## Architecture
 
@@ -189,6 +203,82 @@ recover → request-id → access-log → metrics/tracing → CORS → body-limi
   the very last gate rather than sharing route-match's position: it's
   upstream-scoped state, not route config.
 
+## Docker-compose demo
+
+```bash
+docker compose up --build -d
+bash scripts/demo.sh     # or: make demo
+```
+
+Brings up `gatekeeper-1`/`gatekeeper-2` (`:8080`/`:8081`, admin on
+`:9190`/`:9191`), three test upstreams, Redis, Prometheus (`:9090`),
+Grafana (`:3000`, anonymous admin access, dashboard pre-provisioned),
+Jaeger (`:16686`), and a JWKS mock identity provider (`:8000`). The
+demo script hits both gatekeeper instances to show the Redis-backed
+rate limit is shared rather than per-process, lets `upstream-3`'s
+built-in 75% error rate trip health checks and the circuit breaker,
+and edits the mounted config file on disk before reloading it via the
+admin API (fsnotify hot-reload itself is exercised directly by
+`TestRun_ReloadViaFileChange`, running the binary on the host - Docker
+Desktop's bind-mount layer doesn't reliably forward inotify events for
+host-side edits, so the containerized demo uses the admin endpoint for
+that step instead).
+
+`--profile floorplan` is a placeholder for fronting this project's
+sibling `floorplan-service` as a real upstream - it's not included in
+this repo, so the compose file's `floorplan-service` build context
+needs pointing at wherever that project is checked out locally before
+`docker compose --profile floorplan up` will work.
+
+## Benchmarks & load test
+
+```bash
+make bench      # go test -bench=. -benchmem ./...
+make loadtest   # vegeta: direct-to-upstream vs through-gatekeeper (needs `go install github.com/tsenart/vegeta@latest`)
+```
+
+Hot path, isolated (this machine: 11th Gen i7-11800H, `go test -bench`):
+
+| Operation | ns/op | allocs/op |
+|---|---|---|
+| `router.Table.Match` | 78 | 1 |
+| `balancer.RoundRobin.Pick` | 12 | 0 |
+| `balancer.WeightedRoundRobin.Pick` | 14 | 0 |
+| `balancer.LeastConn.Pick` | 25 | 1 (the release closure) |
+| `ratelimit.Local.Allow` | 41 | 0 |
+| full gateway request (real backend, `httptest.Recorder`) | ~4,050 | 33 |
+
+The three isolated pieces together account for ~2 of the full path's 33
+allocations - the rest is inherent `net/http`/structured-logging cost
+(request cloning in `ReverseProxy`, a real HTTP round trip, `slog`
+JSON formatting), not gatekeeper's own routing/limiting/balancing
+logic, which the isolated numbers above show is already close to free.
+
+Load test (`vegeta`, same machine, one `testupstream` target, no auth/
+rate-limit on the test route so the comparison isolates proxying
+overhead itself):
+
+| Scenario | Target RPS | Achieved | p50 | p99 |
+|---|---|---|---|---|
+| Direct to upstream, all cores | 5,000 | 5,000 (100%) | ~0ms | 0.6ms |
+| Through gatekeeper, all cores | 5,000 | 5,000 (100%) | ~0ms | 11.5ms |
+| Through gatekeeper, all cores | 20,000 | 12,051 (60%) | 10.3ms | 102ms |
+| Through gatekeeper, `GOMAXPROCS=1` | 2,000 | 2,000 (100%) | ~0ms | 20.7ms |
+| Through gatekeeper, `GOMAXPROCS=1` | 6,000+ | plateaus ~4,050 | ~24ms | ~40-58ms |
+
+Honest reading: at a load both sides can sustain (5k RPS), the gateway
+adds real but modest tail latency (p99 0.6ms → 11.5ms) at identical
+throughput. Pushed to 20k RPS on this single laptop, gatekeeper's own
+sustainable ceiling is closer to 5-8k RPS multi-core (degrading well
+before 20k) and ~4k single-core - single-core capacity is roughly a
+third of the multi-core figure despite 16 logical cores being
+available, which points at something *other* than pure CPU parallelism
+(I/O, GC, or lock contention - most likely candidate given the
+benchmark numbers above: synchronous JSON access-log writes to stdout
+on every request) as the actual limiter, not the hand-written balancer/
+limiter/breaker logic itself. Profiling that further (`pprof` under
+sustained load) is the natural next step, not attempted here.
+
 ## Testing
 
 ```bash
@@ -228,6 +318,7 @@ Current coverage:
 | `internal/admin` | ~90% |
 | `internal/auth` | ~89% |
 | `cmd/gatekeeper` | ~68% |
+| `cmd/jwksmock` | ~47% (demo-only tool) |
 | `internal/metrics` | n/a (pure metric definitions, no logic to cover) |
 
 CI (`.github/workflows/ci.yml`) runs `go vet`, `go test -race` with
@@ -246,8 +337,15 @@ commit(s) before moving on.
 - [x] Auth: API key (constant-time compare), JWT/JWKS
 - [x] Circuit breaker + retries with a budget
 - [x] Hot reload (SIGHUP/fsnotify, atomic config swap) + admin API
-- [x] Metrics (Prometheus), tracing (OpenTelemetry) - Grafana dashboard is part of the docker-compose stage below
-- [ ] Benchmarks, load test, docker-compose demo, ADRs, interview Q&A doc
+- [x] Metrics (Prometheus), tracing (OpenTelemetry), Grafana dashboard
+- [x] Benchmarks, load test, docker-compose demo, ADRs, interview Q&A doc
+
+See [`docs/adr/`](docs/adr/) for the design decisions behind the rate
+limiter, smooth WRR, the circuit breaker model, hot reload's
+atomic-pointer approach, the retry budget, and why these mechanisms
+are hand-rolled instead of pulled from a library; see
+[`docs/INTERVIEW.md`](docs/INTERVIEW.md) for 25 interview questions
+this codebase can answer concretely.
 
 ## What's deliberately not done
 
