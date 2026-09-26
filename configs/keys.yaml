@@ -1,0 +1,10 @@
+# Demo api_keys_file: SHA-256 hashes of API keys, never the raw keys
+# themselves. This file's only real key is "demo-key-12345", used by
+# scripts/demo.sh and manual testing - do not reuse it for anything real.
+#
+# To register a new key:
+#   printf '%s' 'your-new-key' | sha256sum
+# and add the resulting hash below.
+keys:
+  - name: demo-client
+    hash: 367fe8933ad8bba8f7ff02c047bcb5c00a4fff3ad6e82fef2bf4ee0c850d7c36

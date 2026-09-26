@@ -42,6 +42,12 @@ and is meant to be explainable, not just "it works."
   multiple gateway instances. `429` responses carry `RateLimit-Limit/
   Remaining/Reset` and `Retry-After`; a Redis outage fails open or closed
   per `rate_limit.fail_open`.
+- Auth per route: API keys (`X-API-Key`, SHA-256 hashes compared with
+  `subtle.ConstantTimeCompare`, never the raw key stored) or JWT (JWKS
+  signature verification, TTL-cached with an immediate refresh on an
+  unknown `kid`, fixed asymmetric-algorithm allow-list so `alg: none`/
+  algorithm confusion can't get through, iss/aud/exp/nbf checked). A
+  valid JWT's `sub` is forwarded upstream as `X-User-ID`.
 
 ## Architecture
 
@@ -52,7 +58,7 @@ flowchart LR
 
     subgraph chain["Middleware chain (internal/middleware)"]
         direction TB
-        recover[Recover] --> reqid[RequestID] --> alog[AccessLog] --> cors[CORS] --> bodylimit[BodyLimit] --> match[Route match] --> ratelimit[RateLimit]
+        recover[Recover] --> reqid[RequestID] --> alog[AccessLog] --> cors[CORS] --> bodylimit[BodyLimit] --> match[Route match] --> authn[Authenticate] --> ratelimit[RateLimit]
     end
 
     chain --> proxy["Proxy handler\n(internal/gateway)"]
@@ -120,7 +126,7 @@ routes:
 ## Middleware order, and why
 
 ```
-recover → request-id → access-log → CORS → body-limit → route-match → [auth → rate-limit → circuit-breaker] → proxy
+recover → request-id → access-log → CORS → body-limit → route-match → auth → rate-limit → [circuit-breaker] → proxy
 ```
 
 - **recover** is outermost so it can catch a panic from every layer below it.
@@ -133,8 +139,9 @@ recover → request-id → access-log → CORS → body-limit → route-match �
   reject bad requests before spending effort on routing or auth.
 - **route-match** has to happen before auth/rate-limit/circuit-breaker
   because those are configured per-route.
-- **rate-limit** now runs right after route-match (auth and circuit-breaker
-  slots, bracketed above, aren't implemented yet).
+- **auth** must reject before **rate-limit** spends a token on a request
+  that was going to be denied anyway.
+- **circuit-breaker** (bracketed above) isn't implemented yet.
 
 ## Testing
 
@@ -163,14 +170,15 @@ Current coverage:
 | Package | Coverage |
 |---|---|
 | `internal/balancer` | 100% |
-| `internal/gateway` | ~96% |
+| `internal/router` | 100% |
 | `internal/logger` | 100% |
 | `internal/reqctx` | 100% |
-| `internal/router` | 100% |
+| `internal/gateway` | ~96% |
 | `internal/middleware` | 98.5% |
-| `internal/ratelimit` | 94.5% (unit only; +Redis path under `-tags=integration`) |
 | `internal/health` | 94.7% |
+| `internal/ratelimit` | 94.5% (unit only; +Redis path under `-tags=integration`) |
 | `internal/config` | ~92% |
+| `internal/auth` | ~89% |
 
 CI (`.github/workflows/ci.yml`) runs `go vet`, `go test -race` with
 coverage, the Redis integration tests (a `redis:7-alpine` service
@@ -185,7 +193,7 @@ commit(s) before moving on.
 - [x] Router, `ReverseProxy`, headers, timeouts, graceful shutdown
 - [x] Balancers (round robin, weighted round robin, least conn) + active/passive health checks
 - [x] Rate limiting: local token bucket, then Redis-backed distributed limiting
-- [ ] Auth: API key (constant-time compare), JWT/JWKS
+- [x] Auth: API key (constant-time compare), JWT/JWKS
 - [ ] Circuit breaker + retries with a budget
 - [ ] Hot reload (SIGHUP/fsnotify, atomic config swap) + admin API
 - [ ] Metrics (Prometheus), tracing (OpenTelemetry), Grafana dashboard
