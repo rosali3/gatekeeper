@@ -66,6 +66,17 @@ and is meant to be explainable, not just "it works."
   `GET /admin/upstreams` (per-target health/active-conns + breaker
   state), `POST /admin/reload`, plus unauthenticated `GET /healthz`,
   `/readyz`, `/metrics` (Prometheus).
+- All eight metrics from the spec (`gateway_requests_total`,
+  `..._request_duration_seconds`, `..._upstream_duration_seconds`,
+  `..._ratelimit_rejected_total`, `..._circuit_state`,
+  `..._upstream_healthy`, `..._retries_total`,
+  `..._active_connections`), recorded at the point each happens except
+  health/breaker state, which get polled every 5s since they're ongoing
+  conditions rather than one-off events. OpenTelemetry tracing:
+  incoming `traceparent` is extracted, a span started, and an updated
+  `traceparent` injected into the outbound upstream request - no
+  exporter wired yet (that's the docker-compose/Jaeger stage), so spans
+  propagate correctly today but aren't shipped anywhere yet.
 
 ## Architecture
 
@@ -76,7 +87,7 @@ flowchart LR
 
     subgraph chain["Middleware chain (internal/middleware)"]
         direction TB
-        recover[Recover] --> reqid[RequestID] --> alog[AccessLog] --> cors[CORS] --> bodylimit[BodyLimit] --> match[Route match] --> authn[Authenticate] --> ratelimit[RateLimit]
+        recover[Recover] --> reqid[RequestID] --> alog[AccessLog] --> metrics[Metrics] --> tracing[Tracing] --> cors[CORS] --> bodylimit[BodyLimit] --> match[Route match] --> authn[Authenticate] --> ratelimit[RateLimit]
     end
 
     chain --> cb{"Breaker.Allow()?\n(internal/breaker)"}
@@ -154,7 +165,7 @@ routes:
 ## Middleware order, and why
 
 ```
-recover → request-id → access-log → CORS → body-limit → route-match → auth → rate-limit → circuit-breaker → proxy (+retries)
+recover → request-id → access-log → metrics/tracing → CORS → body-limit → route-match → auth → rate-limit → circuit-breaker → proxy (+retries)
 ```
 
 - **recover** is outermost so it can catch a panic from every layer below it.
@@ -163,6 +174,10 @@ recover → request-id → access-log → CORS → body-limit → route-match �
 - **access-log** wraps everything downstream of it (CORS, body-limit,
   routing, proxying) so it can report the final status/route/upstream/
   target after the whole chain has run.
+- **metrics/tracing** sit right after logging, per the spec's own order -
+  metrics needs the same "wraps everything downstream" shape as
+  access-log (to read the final route/status), and tracing needs to
+  start its span before anything downstream can use it.
 - **CORS** and **body-limit** are cheap, request-shape checks that should
   reject bad requests before spending effort on routing or auth.
 - **route-match** has to happen before auth/rate-limit/circuit-breaker
@@ -205,14 +220,15 @@ Current coverage:
 | `internal/logger` | 100% |
 | `internal/reqctx` | 100% |
 | `internal/breaker` | ~96% |
-| `internal/gateway` | ~94% |
-| `internal/middleware` | 98.5% |
+| `internal/gateway` | ~95% |
+| `internal/middleware` | ~99% |
 | `internal/health` | 94.7% |
 | `internal/ratelimit` | 94.5% (unit only; +Redis path under `-tags=integration`) |
 | `internal/config` | ~92% |
 | `internal/admin` | ~90% |
 | `internal/auth` | ~89% |
-| `cmd/gatekeeper` | ~66% |
+| `cmd/gatekeeper` | ~68% |
+| `internal/metrics` | n/a (pure metric definitions, no logic to cover) |
 
 CI (`.github/workflows/ci.yml`) runs `go vet`, `go test -race` with
 coverage, the Redis integration tests (a `redis:7-alpine` service
@@ -230,7 +246,7 @@ commit(s) before moving on.
 - [x] Auth: API key (constant-time compare), JWT/JWKS
 - [x] Circuit breaker + retries with a budget
 - [x] Hot reload (SIGHUP/fsnotify, atomic config swap) + admin API
-- [ ] Metrics (Prometheus), tracing (OpenTelemetry), Grafana dashboard
+- [x] Metrics (Prometheus), tracing (OpenTelemetry) - Grafana dashboard is part of the docker-compose stage below
 - [ ] Benchmarks, load test, docker-compose demo, ADRs, interview Q&A doc
 
 ## What's deliberately not done
