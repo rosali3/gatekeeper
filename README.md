@@ -55,6 +55,17 @@ and is meant to be explainable, not just "it works."
   errors/502/503/504, capped by both `retries.max` and a retry budget
   (retries ≤ `budget_ratio` of recent request volume) so a struggling
   upstream can't be hit with a multiplying retry storm.
+- Hot reload on SIGHUP, on the config file changing on disk (debounced
+  fsnotify), or via `POST /admin/reload`. A reload that fails to parse/
+  validate leaves the running config untouched; one that succeeds swaps
+  in atomically, reusing the exact same balancer/breaker/retry-budget/
+  rate-limiter state for any upstream or route whose config didn't
+  actually change (so in-flight breaker trips, health status and
+  token-bucket contents survive a reload of *other* parts of the config).
+- A separate admin API (own port, Bearer token): `GET /admin/routes`,
+  `GET /admin/upstreams` (per-target health/active-conns + breaker
+  state), `POST /admin/reload`, plus unauthenticated `GET /healthz`,
+  `/readyz`, `/metrics` (Prometheus).
 
 ## Architecture
 
@@ -86,13 +97,15 @@ flowchart LR
 
 Each config generation compiles into one immutable `gateway.Snapshot`
 (route table + per-upstream balancers/proxies + the fully assembled
-handler chain) held behind an `atomic.Pointer`. Nothing hot-swaps yet
-(that's hot reload, still to come), but the plumbing is already in place
-for it.
+handler chain) held behind an `atomic.Pointer`. A reload builds a new
+Snapshot and swaps it in atomically - requests already in flight keep
+using the old one, and unchanged upstreams/routes carry their runtime
+state (balancer target health, breaker state, rate-limiter buckets)
+straight into the new Snapshot instead of starting fresh.
 
 ## Quickstart
 
-Requires Go 1.24+.
+Requires Go 1.25+.
 
 ```bash
 go build -o bin/gatekeeper ./cmd/gatekeeper
@@ -102,10 +115,15 @@ go build -o bin/testupstream ./cmd/testupstream
 ADDR=:9001 NAME=backend-1 ./bin/testupstream &
 ADDR=:9002 NAME=backend-2 ./bin/testupstream &
 
-./bin/gatekeeper --config=configs/gatekeeper.example.yaml &
+ADMIN_TOKEN=demo-admin-token ./bin/gatekeeper --config=configs/gatekeeper.example.yaml &
 
 curl http://localhost:8080/api/floorplan/rooms
+curl -H "Authorization: Bearer demo-admin-token" http://localhost:9090/admin/upstreams
 ```
+
+`gatekeeper` refuses to start if the env var named by `admin.token_env`
+(`ADMIN_TOKEN` above) is unset or empty - an admin API with no real
+token isn't worth serving.
 
 `testupstream` is a small backend with configurable behavior via env vars
 (`DELAY`, `ERROR_RATE`, `HEALTHY`) — handy for poking at load balancing,
@@ -192,7 +210,9 @@ Current coverage:
 | `internal/health` | 94.7% |
 | `internal/ratelimit` | 94.5% (unit only; +Redis path under `-tags=integration`) |
 | `internal/config` | ~92% |
+| `internal/admin` | ~90% |
 | `internal/auth` | ~89% |
+| `cmd/gatekeeper` | ~66% |
 
 CI (`.github/workflows/ci.yml`) runs `go vet`, `go test -race` with
 coverage, the Redis integration tests (a `redis:7-alpine` service
@@ -209,7 +229,7 @@ commit(s) before moving on.
 - [x] Rate limiting: local token bucket, then Redis-backed distributed limiting
 - [x] Auth: API key (constant-time compare), JWT/JWKS
 - [x] Circuit breaker + retries with a budget
-- [ ] Hot reload (SIGHUP/fsnotify, atomic config swap) + admin API
+- [x] Hot reload (SIGHUP/fsnotify, atomic config swap) + admin API
 - [ ] Metrics (Prometheus), tracing (OpenTelemetry), Grafana dashboard
 - [ ] Benchmarks, load test, docker-compose demo, ADRs, interview Q&A doc
 
