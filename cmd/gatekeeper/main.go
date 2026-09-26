@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -39,6 +40,12 @@ const idleTimeout = 120 * time.Second
 // not config-exposed, same rationale as above; the main server's comes
 // from server.read_header_timeout since that one is in the schema.
 const adminReadHeaderTimeout = 5 * time.Second
+
+// metricsRefreshInterval is how often gateway_upstream_healthy/
+// gateway_circuit_state get polled and re-exported - see
+// gateway.Gateway.RefreshMetrics's doc comment for why those two need
+// polling instead of being recorded at request time like the others.
+const metricsRefreshInterval = 5 * time.Second
 
 func main() {
 	configPath := flag.String("config", "configs/gatekeeper.example.yaml", "path to the gatekeeper config file")
@@ -76,9 +83,15 @@ func main() {
 	}
 }
 
-// serve owns the signal-context's lifetime, so its defer runs before main
-// can os.Exit on error.
+// serve owns both the tracing-provider's and the signal-context's
+// lifetimes, so their defers run before main can os.Exit on error.
 func serve(mainLn, adminLn net.Listener, cfg *config.Config, configPath, adminToken string, log *slog.Logger) error {
+	tp, err := setupTracing()
+	if err != nil {
+		return fmt.Errorf("setting up tracing: %w", err)
+	}
+	defer shutdownTracing(context.Background(), tp)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return run(ctx, mainLn, adminLn, cfg, configPath, adminToken, log)
@@ -104,6 +117,8 @@ func run(ctx context.Context, mainLn, adminLn net.Listener, cfg *config.Config, 
 
 	fileChanged := make(chan struct{}, 1)
 	go watchConfigFile(ctx, configPath, fileChanged, log)
+
+	go refreshMetricsPeriodically(ctx, gw, metricsRefreshInterval)
 
 	go func() {
 		for {
@@ -162,6 +177,22 @@ func run(ctx context.Context, mainLn, adminLn net.Listener, cfg *config.Config, 
 			errs = append(errs, err)
 		}
 		return errors.Join(errs...)
+	}
+}
+
+// refreshMetricsPeriodically polls gw.RefreshMetrics until ctx is
+// canceled, keeping gateway_upstream_healthy/gateway_circuit_state
+// current even during a quiet period with no traffic to derive them from.
+func refreshMetricsPeriodically(ctx context.Context, gw *gateway.Gateway, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			gw.RefreshMetrics()
+		}
 	}
 }
 
