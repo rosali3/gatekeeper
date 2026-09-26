@@ -1,6 +1,8 @@
 // Command gatekeeper is the API gateway entry point: loads config, builds
-// the routing/proxy pipeline and serves it with a graceful shutdown. The
-// admin API and hot reload land in a later stage.
+// the routing/proxy pipeline, serves it with a graceful shutdown, and
+// exposes a separate Bearer-token-protected admin API. Config reloads on
+// SIGHUP, on the config file changing on disk, or via POST
+// /admin/reload.
 package main
 
 import (
@@ -15,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"gatekeeper/internal/admin"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/gateway"
 	"gatekeeper/internal/logger"
@@ -32,6 +35,11 @@ const shutdownTimeout = 15 * time.Second
 // so it's a sensible hardcoded default.
 const idleTimeout = 120 * time.Second
 
+// adminReadHeaderTimeout is the admin server's own header-read timeout -
+// not config-exposed, same rationale as above; the main server's comes
+// from server.read_header_timeout since that one is in the schema.
+const adminReadHeaderTimeout = 5 * time.Second
+
 func main() {
 	configPath := flag.String("config", "configs/gatekeeper.example.yaml", "path to the gatekeeper config file")
 	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
@@ -45,13 +53,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	ln, err := net.Listen("tcp", cfg.Server.Listen)
+	mainLn, err := net.Listen("tcp", cfg.Server.Listen)
 	if err != nil {
 		log.Error("failed to listen", "error", err, "listen", cfg.Server.Listen)
 		os.Exit(1)
 	}
+	adminLn, err := net.Listen("tcp", cfg.Admin.Listen)
+	if err != nil {
+		log.Error("failed to listen (admin)", "error", err, "listen", cfg.Admin.Listen)
+		os.Exit(1)
+	}
 
-	if err := serve(ln, cfg, log); err != nil {
+	adminToken := os.Getenv(cfg.Admin.TokenEnv)
+	if adminToken == "" {
+		log.Error("admin token env var is unset or empty - refusing to start an unprotected admin API", "env", cfg.Admin.TokenEnv)
+		os.Exit(1)
+	}
+
+	if err := serve(mainLn, adminLn, cfg, *configPath, adminToken, log); err != nil {
 		log.Error("server failed", "error", err)
 		os.Exit(1)
 	}
@@ -59,16 +78,17 @@ func main() {
 
 // serve owns the signal-context's lifetime, so its defer runs before main
 // can os.Exit on error.
-func serve(ln net.Listener, cfg *config.Config, log *slog.Logger) error {
+func serve(mainLn, adminLn net.Listener, cfg *config.Config, configPath, adminToken string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return run(ctx, ln, cfg, log)
+	return run(ctx, mainLn, adminLn, cfg, configPath, adminToken, log)
 }
 
-// run serves the gateway on ln until ctx is canceled, then drains in-flight
-// requests up to shutdownTimeout. Taking ln (rather than binding inside)
-// lets tests use an ephemeral port and know its address up front.
-func run(ctx context.Context, ln net.Listener, cfg *config.Config, log *slog.Logger) error {
+// run serves the gateway and admin API on their respective listeners
+// until ctx is canceled, then drains in-flight requests up to
+// shutdownTimeout. Taking the listeners (rather than binding inside)
+// lets tests use ephemeral ports and know their addresses up front.
+func run(ctx context.Context, mainLn, adminLn net.Listener, cfg *config.Config, configPath, adminToken string, log *slog.Logger) error {
 	snap, err := gateway.Build(ctx, cfg, log, nil)
 	if err != nil {
 		return err
@@ -76,32 +96,95 @@ func run(ctx context.Context, ln net.Listener, cfg *config.Config, log *slog.Log
 	gw := gateway.New()
 	gw.Swap(snap)
 
-	srv := &http.Server{
+	reload := newReloader(ctx, gw, configPath, log)
+
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+	defer signal.Stop(sighup)
+
+	fileChanged := make(chan struct{}, 1)
+	go watchConfigFile(ctx, configPath, fileChanged, log)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sighup:
+				log.Info("SIGHUP received, reloading config")
+				_ = reload()
+			case <-fileChanged:
+				log.Info("config file changed on disk, reloading")
+				_ = reload()
+			}
+		}
+	}()
+
+	mainSrv := &http.Server{
 		Handler:           gw,
 		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Duration(),
 		IdleTimeout:       idleTimeout,
 	}
+	adminSrv := &http.Server{
+		Handler:           admin.NewHandler(gw, reload, adminToken),
+		ReadHeaderTimeout: adminReadHeaderTimeout,
+	}
 
-	serveErr := make(chan error, 1)
+	serveErr := make(chan error, 2)
 	go func() {
-		log.Info("gatekeeper listening",
-			"listen", ln.Addr().String(),
-			"upstreams", len(cfg.Upstreams),
-			"routes", len(cfg.Routes),
-		)
-		serveErr <- srv.Serve(ln)
+		log.Info("gatekeeper listening", "listen", mainLn.Addr().String(), "upstreams", len(cfg.Upstreams), "routes", len(cfg.Routes))
+		serveErr <- mainSrv.Serve(mainLn)
+	}()
+	go func() {
+		log.Info("admin API listening", "listen", adminLn.Addr().String())
+		serveErr <- adminSrv.Serve(adminLn)
 	}()
 
 	select {
 	case err := <-serveErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
 		}
-		return nil
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		_ = mainSrv.Shutdown(shutdownCtx)
+		_ = adminSrv.Shutdown(shutdownCtx)
+		return err
 	case <-ctx.Done():
 		log.Info("shutdown signal received, draining in-flight requests", "timeout", shutdownTimeout)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		var errs []error
+		if err := mainSrv.Shutdown(shutdownCtx); err != nil {
+			errs = append(errs, err)
+		}
+		if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+			errs = append(errs, err)
+		}
+		return errors.Join(errs...)
+	}
+}
+
+// newReloader returns the function that actually performs a reload:
+// re-read and validate configPath, rebuild the gateway (reusing state
+// for anything unchanged, per gateway.Build), and swap it in. On any
+// error the current config keeps running - the old Snapshot is simply
+// never replaced - and the error is both logged and returned so the
+// admin API's POST /admin/reload can report it too.
+func newReloader(ctx context.Context, gw *gateway.Gateway, configPath string, log *slog.Logger) func() error {
+	return func() error {
+		cfg, err := config.Load(configPath)
+		if err != nil {
+			log.Error("reload: failed to load config, keeping current config", "error", err)
+			return err
+		}
+		snap, err := gateway.Build(ctx, cfg, log, gw.Current())
+		if err != nil {
+			log.Error("reload: failed to build gateway, keeping current config", "error", err)
+			return err
+		}
+		gw.Swap(snap)
+		log.Info("config reloaded", "upstreams", len(cfg.Upstreams), "routes", len(cfg.Routes))
+		return nil
 	}
 }
