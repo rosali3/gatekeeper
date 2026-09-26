@@ -1,0 +1,93 @@
+name: gatekeeper-demo
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  jwksmock:
+    build: { context: ., target: jwksmock }
+    environment:
+      ADDR: ":8000"
+      ISSUER: gatekeeper-demo
+      AUDIENCE: gatekeeper
+    ports: ["8000:8000"]
+
+  upstream-1:
+    build: { context: ., target: testupstream }
+    environment: { ADDR: ":8080", NAME: upstream-1 }
+
+  upstream-2:
+    build: { context: ., target: testupstream }
+    environment: { ADDR: ":8080", NAME: upstream-2 }
+
+  # Deliberately slower and flakier than upstream-1/2, so the demo can
+  # show health-check eviction, passive failures and the circuit breaker
+  # tripping without needing to kill a container by hand.
+  upstream-3:
+    build: { context: ., target: testupstream }
+    environment: { ADDR: ":8080", NAME: upstream-3, DELAY: "100ms", ERROR_RATE: "0.75" }
+
+  gatekeeper-1:
+    build: { context: ., target: gatekeeper }
+    depends_on: [redis, upstream-1, upstream-2, upstream-3, jwksmock]
+    environment:
+      ADMIN_TOKEN: demo-admin-token
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    volumes:
+      - ./docker/gatekeeper.yaml:/etc/gatekeeper/gatekeeper.yaml:ro
+    command: ["--config=/etc/gatekeeper/gatekeeper.yaml"]
+    ports: ["8080:8080", "9190:9090"]
+
+  # A second instance sharing the same Redis is what actually
+  # demonstrates the rate limiter's whole reason for a distributed
+  # backend: hit either one, the limit is shared, not per-process.
+  gatekeeper-2:
+    build: { context: ., target: gatekeeper }
+    depends_on: [redis, upstream-1, upstream-2, upstream-3, jwksmock]
+    environment:
+      ADMIN_TOKEN: demo-admin-token
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    volumes:
+      - ./docker/gatekeeper.yaml:/etc/gatekeeper/gatekeeper.yaml:ro
+    command: ["--config=/etc/gatekeeper/gatekeeper.yaml"]
+    ports: ["8081:8080", "9191:9090"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [gatekeeper-1, gatekeeper-2]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686", "4317:4317"]
+
+  # Not included by default - this is a placeholder for the TZ's
+  # --profile floorplan (a second, real project this gateway can front
+  # in a demo). Point build.context at wherever you've checked
+  # floorplan-service out locally, then run:
+  #   docker compose --profile floorplan up
+  floorplan-service:
+    profiles: ["floorplan"]
+    build:
+      context: ../floorplan-service
+    environment: { ADDR: ":8080" }

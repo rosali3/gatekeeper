@@ -1,0 +1,33 @@
+server:
+  listen: ":8080"
+  read_header_timeout: 5s
+  max_body_bytes: 10MB
+admin:
+  listen: ":9090"
+  token_env: ADMIN_TOKEN
+upstreams:
+  demo:
+    balancer: least_conn
+    targets:
+      - { url: http://upstream-1:8080, weight: 1 }
+      - { url: http://upstream-2:8080, weight: 1 }
+      - { url: http://upstream-3:8080, weight: 1 }
+    health_check: { path: /healthz, interval: 3s, timeout: 1s, healthy_threshold: 2, unhealthy_threshold: 2 }
+    circuit_breaker: { failure_ratio: 0.5, min_requests: 5, window: 10s, open_timeout: 10s, half_open_max: 2 }
+    timeout: 5s
+    retries: { max: 2, only_idempotent: true, budget_ratio: 0.2 }
+routes:
+  - match: { path_prefix: /api/demo/, methods: [GET, POST] }
+    strip_prefix: /api/demo
+    upstream: demo
+    auth: none
+    rate_limit: { key: ip, rps: 2, burst: 5, backend: redis, fail_open: false }
+  - match: { path_prefix: /api/secure/, methods: [GET] }
+    strip_prefix: /api/secure
+    upstream: demo
+    auth: jwt
+auth:
+  api_keys_file: ""
+  jwt: { jwks_url: "http://jwksmock:8000/.well-known/jwks.json", issuer: gatekeeper-demo, audience: gatekeeper, cache_ttl: 5m }
+cors: { allowed_origins: ["http://localhost:3000"] }
+redis: { addr: "redis:6379" }
