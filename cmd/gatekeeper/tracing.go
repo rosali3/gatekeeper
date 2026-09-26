@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"os"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -15,11 +17,11 @@ import (
 // injection (internal/gateway/proxy.go) both rely on being set - otel's
 // defaults are no-ops otherwise.
 //
-// No exporter is registered yet: spans are created and propagated (the
-// TZ's actual requirement - "контекст пробрасывается в апстрим через
-// traceparent") but not shipped anywhere. The docker-compose stage adds a
-// real OTLP exporter pointed at Jaeger via sdktrace.WithBatcher on this
-// same provider, without touching this function's callers.
+// An OTLP/gRPC exporter (e.g. to Jaeger) is only wired up if
+// OTEL_EXPORTER_OTLP_ENDPOINT is set - the standard OTel env var, used
+// by the docker-compose demo. Without it, spans are still created and
+// propagated (the TZ's actual requirement) but not shipped anywhere,
+// which is all local runs/tests need.
 func setupTracing() (*sdktrace.TracerProvider, error) {
 	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(
 		semconv.ServiceName("gatekeeper"),
@@ -28,7 +30,19 @@ func setupTracing() (*sdktrace.TracerProvider, error) {
 		return nil, err
 	}
 
-	tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res))
+	opts := []sdktrace.TracerProviderOption{sdktrace.WithResource(res)}
+	if endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); endpoint != "" {
+		exporter, err := otlptracegrpc.New(context.Background(),
+			otlptracegrpc.WithEndpointURL(endpoint),
+			otlptracegrpc.WithInsecure(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, sdktrace.WithBatcher(exporter))
+	}
+
+	tp := sdktrace.NewTracerProvider(opts...)
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	return tp, nil

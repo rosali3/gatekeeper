@@ -1,0 +1,21 @@
+server:
+  listen: ":18080"
+  read_header_timeout: 5s
+  max_body_bytes: 1MB
+admin:
+  listen: ":19090"
+  token_env: LOADTEST_ADMIN_TOKEN
+upstreams:
+  demo:
+    balancer: round_robin
+    targets:
+      - { url: http://localhost:19001, weight: 1 }
+    health_check: { path: /healthz, interval: 1h, timeout: 1s, healthy_threshold: 1, unhealthy_threshold: 1 }
+    circuit_breaker: { failure_ratio: 0.9, min_requests: 1000000, window: 60s, open_timeout: 1s, half_open_max: 1 }
+    timeout: 5s
+    retries: { max: 0, only_idempotent: true, budget_ratio: 0 }
+routes:
+  - match: { path_prefix: /api/demo/, methods: [GET] }
+    strip_prefix: /api/demo
+    upstream: demo
+    auth: none
