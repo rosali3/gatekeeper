@@ -42,3 +42,10 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          # A prebuilt golangci-lint binary is built with whatever Go
+          # version *its own* release used, which can lag behind this
+          # project's go.mod (a dependency graph can require a newer Go
+          # than golangci-lint's latest release supports parsing export
+          # data for). Building it locally with our own toolchain avoids
+          # that mismatch entirely.
+          install-mode: goinstall
